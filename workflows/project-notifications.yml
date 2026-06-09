@@ -1,0 +1,139 @@
+name: Project Change Notifications
+
+on:
+  projects_v2_item:
+    types: [created, edited, deleted, archived, restored, converted, reordered]
+
+jobs:
+  notify-slack:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Get item details via GraphQL
+        id: get_details
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ITEM_ID="${{ github.event.projects_v2_item.node_id }}"
+
+          RESPONSE=$(curl -s -X POST https://api.github.com/graphql \
+            -H "Authorization: bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"query\": \"query { node(id: \\\"${ITEM_ID}\\\") { ... on ProjectV2Item { content { ... on Issue { title url } ... on PullRequest { title url } ... on DraftIssue { title } } fieldValues(first: 20) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { name } } } ... on ProjectV2ItemFieldDateValue { date field { ... on ProjectV2Field { name } } } } } } } }\"
+            }")
+
+          TITLE=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          try:
+              content = data['data']['node']['content']
+              print(content.get('title', 'Unknown title'))
+          except:
+              print('Unknown title')
+          ")
+
+          URL=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          try:
+              content = data['data']['node']['content']
+              print(content.get('url', ''))
+          except:
+              print('')
+          ")
+
+          STATUS=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          try:
+              nodes = data['data']['node']['fieldValues']['nodes']
+              for node in nodes:
+                  if node.get('field', {}).get('name', '').lower() == 'status':
+                      print(node.get('name', 'Unknown'))
+                      sys.exit()
+              print('No status set')
+          except:
+              print('Unknown')
+          ")
+
+          FIELDS=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          try:
+              nodes = data['data']['node']['fieldValues']['nodes']
+              lines = []
+              for node in nodes:
+                  fname = node.get('field', {}).get('name', '')
+                  fval = node.get('name') or node.get('text') or node.get('date') or ''
+                  if fname and fval and fname.lower() != 'status':
+                      lines.append(f'• *{fname}:* {fval}')
+              print('\n'.join(lines))
+          except:
+              print('')
+          ")
+
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "fields<<$EOF" >> $GITHUB_OUTPUT
+          echo "$FIELDS" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+
+      - name: Build and send Slack message
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTION: ${{ github.event.action }}
+          ACTOR: ${{ github.actor }}
+          TITLE: ${{ steps.get_details.outputs.title }}
+          URL: ${{ steps.get_details.outputs.url }}
+          STATUS: ${{ steps.get_details.outputs.status }}
+          FIELDS: ${{ steps.get_details.outputs.fields }}
+          CONTENT_TYPE: ${{ github.event.projects_v2_item.content_type }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, urllib.request
+
+          action   = os.environ["ACTION"]
+          actor    = os.environ["ACTOR"]
+          title    = os.environ["TITLE"]
+          url      = os.environ["URL"]
+          status   = os.environ["STATUS"]
+          fields   = os.environ["FIELDS"]
+          ctype    = os.environ["CONTENT_TYPE"]
+          webhook  = os.environ["SLACK_WEBHOOK_URL"]
+
+          title_link = f"<{url}|{title}>" if url else title
+
+          emoji = {
+              "created": "➕",
+              "edited": "✏️",
+              "deleted": "🗑️",
+              "archived": "📦",
+              "restored": "♻️",
+              "converted": "🔄",
+              "reordered": "↕️",
+          }.get(action, "🔔")
+
+          lines = [
+              f"{emoji} *Project item {action}* by *{actor}*",
+              f"• *Title:* {title_link}",
+              f"• *Type:* {ctype}",
+              f"• *Status:* {status}",
+          ]
+          if fields.strip():
+              lines.append(fields)
+
+          payload = json.dumps({"text": "\n".join(lines)})
+          req = urllib.request.Request(
+              webhook,
+              data=payload.encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+          urllib.request.urlopen(req)
+          print("Slack notification sent.")
+          PYEOF
